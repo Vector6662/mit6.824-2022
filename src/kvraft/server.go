@@ -4,6 +4,7 @@ import (
 	"6.824/labgob"
 	"6.824/labrpc"
 	"6.824/raft"
+	"bytes"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -31,9 +32,9 @@ type Op struct {
 }
 
 type Session struct {
-	clientId          int64
-	latestSequenceNum int64
-	reply             Reply
+	ClientId          int64
+	LatestSequenceNum int64
+	Reply             Reply
 }
 
 type KVServer struct {
@@ -46,9 +47,12 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	persister     *raft.Persister
 	clientSession map[int64]Session
 	data          Data
 	notifyChanMap map[int]chan Reply
+
+	lastApplied int
 }
 
 func (kv *KVServer) applier() {
@@ -56,11 +60,19 @@ func (kv *KVServer) applier() {
 		applyMsg := <-kv.applyCh
 		if applyMsg.CommandValid {
 			var reply Reply
+			if applyMsg.Command == nil {
+				continue
+				print("")
+			}
 			commandIndex, op := applyMsg.CommandIndex, applyMsg.Command.(Op)
-
 			kv.mu.Lock()
+			if commandIndex <= kv.lastApplied {
+				kv.mu.Unlock()
+				continue
+			}
+			kv.lastApplied = commandIndex
 			if GET != op.Method && kv.isDuplicate(op.ClientId, op.SequenceNum) {
-				reply = kv.clientSession[op.ClientId].reply
+				reply = kv.clientSession[op.ClientId].Reply
 			} else {
 				switch op.Method {
 				case PUT:
@@ -72,19 +84,27 @@ func (kv *KVServer) applier() {
 				}
 				if GET != op.Method {
 					kv.clientSession[op.ClientId] = Session{
-						clientId:          op.ClientId,
-						latestSequenceNum: op.SequenceNum,
-						reply:             reply,
+						ClientId:          op.ClientId,
+						LatestSequenceNum: op.SequenceNum,
+						Reply:             reply,
 					}
 				}
 			}
+			// todo $8提到了实现读一致性：“第二，需要保证自己仍然是leader才能处理读请求“
 			if currentTerm, isLeader := kv.rf.GetState(); isLeader && currentTerm == applyMsg.CommandTerm {
 				kv.notifyChanMap[commandIndex] <- reply
 			}
+			//todo snapshot
+			kv.snapshot(commandIndex)
 			kv.mu.Unlock()
 		} else if applyMsg.SnapshotValid {
 			// todo snapshot
-
+			kv.mu.Lock()
+			if kv.rf.CondInstallSnapshot(applyMsg.SnapshotTerm, applyMsg.SnapshotIndex, applyMsg.Snapshot) {
+				kv.readSnapshot(applyMsg.Snapshot)
+				kv.lastApplied = applyMsg.SnapshotIndex
+			}
+			kv.mu.Unlock()
 		}
 	}
 }
@@ -92,14 +112,6 @@ func (kv *KVServer) applier() {
 func (kv *KVServer) RPC(args *Args, reply *Reply) {
 	// todo 我自己的逻辑一直有bug，但我还没找到是啥问题。下边的代码参照了这里的逻辑：https://github.com/OneSizeFitsQuorum/MIT6.824-2021/blob/master/docs/lab3.md
 	//
-	kv.mu.Lock()
-	if GET != args.Method && kv.isDuplicate(args.ClientId, args.SequenceNum) {
-		r := kv.clientSession[args.ClientId].reply
-		reply.Value, reply.Err = r.Value, r.Err
-		kv.mu.Unlock()
-		return
-	}
-	kv.mu.Unlock()
 
 	op := Op{ //感觉这么做duck不必啊，反正字段和args都一毛一样
 		ClientId:    args.ClientId,
@@ -108,36 +120,63 @@ func (kv *KVServer) RPC(args *Args, reply *Reply) {
 		Value:       args.Value,
 		Method:      args.Method,
 	}
-	// todo $8提到了实现读一致性second，需要保证自己仍然是leader才能处理读请求
 	index, _, isLeader := kv.rf.Start(op)
 	if !isLeader {
 		reply.Err = ErrWrongLeader
 		return
 	}
-	DPrintf("start execute(leader:%v, index:%v)", kv.me, index)
-	notifyChan := make(chan Reply, 1)
 	kv.mu.Lock()
-	kv.notifyChanMap[index] = notifyChan
+	notifyChan, ok := kv.notifyChanMap[index]
+	if !ok {
+		notifyChan = make(chan Reply, 1)
+		kv.notifyChanMap[index] = notifyChan
+	}
 	kv.mu.Unlock()
 
 	select {
 	case r := <-notifyChan:
 		reply.Value, reply.Err = r.Value, r.Err
 	case <-time.After(ExecutionTimeOut()):
-		go func() {
-			<-notifyChan
-		}()
 		reply.Err = ErrTimeOut
 	}
+	go func() {
+		kv.mu.Lock()
+		delete(kv.notifyChanMap, index)
+		kv.mu.Unlock()
+	}()
 }
-
 
 func (kv *KVServer) isDuplicate(clientId, sequenceNum int64) bool {
 	session, ok := kv.clientSession[clientId]
 	if !ok {
 		return false
 	}
-	return session.latestSequenceNum == sequenceNum
+	return session.LatestSequenceNum >= sequenceNum
+}
+
+func (kv *KVServer) snapshot(index int) {
+	if kv.maxraftstate == -1 || kv.persister.RaftStateSize() < kv.maxraftstate {
+		return
+	}
+	w := &bytes.Buffer{}
+	e := labgob.NewEncoder(w)
+	_ = e.Encode(kv.data)
+	_ = e.Encode(kv.clientSession)
+	kv.rf.Snapshot(index, w.Bytes())
+}
+
+func (kv *KVServer) readSnapshot(snapshot []byte) {
+	if snapshot == nil || len(snapshot) < 1 {
+		return
+	}
+	r := bytes.NewBuffer(snapshot)
+	d := labgob.NewDecoder(r)
+	var data Data
+	var clientSession map[int64]Session
+
+	d.Decode(&data)
+	d.Decode(&clientSession)
+	kv.data, kv.clientSession = data, clientSession
 }
 
 // Kill
@@ -188,12 +227,15 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+	kv.persister = persister
 
 	// You may need initialization code here.
 	kv.data = make(map[string]string)
 	kv.notifyChanMap = make(map[int]chan Reply)
 	kv.clientSession = make(map[int64]Session)
 
+	kv.lastApplied = 0
+	kv.readSnapshot(persister.ReadSnapshot())
 	go kv.applier()
 
 	return kv

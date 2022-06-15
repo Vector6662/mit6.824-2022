@@ -38,12 +38,12 @@ func Max(x, y int) int {
 
 // ElectionTimeOut randomize
 func ElectionTimeOut() time.Duration {
-	rand := time.Duration(800+rand2.Intn(150)) * time.Millisecond //[100,150)毫秒内的随机等待时间
+	rand := time.Duration(150+rand2.Intn(150)) * time.Millisecond //[100,150)毫秒内的随机等待时间
 	return rand
 }
 
 // HeartbeatTimeOut stable
 func HeartbeatTimeOut() time.Duration {
-	n := 125 * time.Millisecond
+	n := 21 * time.Millisecond
 	return n
 }

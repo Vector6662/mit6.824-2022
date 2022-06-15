@@ -31,40 +31,6 @@ import (
 	"6.824/labrpc"
 )
 
-// ApplyMsg
-// as each Raft peer becomes aware that successive log entries are
-// committed, the peer should send an ApplyMsg to the service (or
-// tester) on the same server, via the applyCh passed to Make(). set
-// CommandValid to true to indicate that the ApplyMsg contains a newly
-// committed log entry.
-//
-// in part 2D you'll want to send other kinds of messages (e.g.,
-// snapshots) on the applyCh, but set CommandValid to false for these
-// other uses.
-//
-type ApplyMsg struct {
-	CommandValid bool
-	Command      interface{}
-	CommandIndex int
-	CommandTerm  int
-
-	// For 2D:
-	SnapshotValid bool
-	Snapshot      []byte
-	SnapshotTerm  int
-	SnapshotIndex int
-}
-type Entry struct {
-	Index   int
-	Term    int
-	Command interface{}
-}
-
-var emptyEntry = Entry{
-	Term:  0,
-	Index: 0,
-}
-
 type Log struct {
 	entries []Entry
 	mu      sync.RWMutex
@@ -115,12 +81,6 @@ func (l *Log) checkEntry(entry *Entry) bool {
 	// 应该不会出现entry.Term>lastEntry.Term，且entry.Index <= lastEntry.Index的情况，在一个term下index只可能递增
 	return true
 }
-
-const (
-	Follower  = 1
-	Leader    = 2
-	Candidate = 3
-)
 
 // Raft
 // A Go object implementing a single Raft peer.
@@ -199,6 +159,47 @@ func (rf *Raft) readPersist(data []byte) {
 	}
 }
 
+func (rf *Raft) readSnapshot(data []byte) {
+	if data == nil || len(data) < 1 {
+		return
+	}
+
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+
+	var lastIncludedIndex, lastIncludedTerm int
+	_ = d.Decode(&lastIncludedIndex)
+	_ = d.Decode(&lastIncludedTerm)
+
+	if lastIncludedIndex <= rf.commitIndex {
+		return
+	}
+
+	if lastIncludedIndex > rf.log.lastEntry().Index {
+		//占据entries切片中下标为0的位置，始终得保持entries不为空
+		rf.log.entries = make([]Entry, 1)
+	} else {
+		rf.log.entries = rf.log.entries[lastIncludedIndex-rf.log.firstEntry().Index:]
+	}
+	rf.log.entries[0].Index, rf.log.entries[0].Term, rf.log.entries[0].Command =
+		lastIncludedIndex, lastIncludedTerm, nil
+
+	rf.commitIndex, rf.lastApplied = lastIncludedIndex, lastIncludedIndex
+
+	//apply
+	go func() {
+		rf.applyCh <- ApplyMsg{
+			CommandValid:  false,
+			SnapshotValid: true,
+			Snapshot:      data,
+			SnapshotTerm:  lastIncludedTerm,
+			SnapshotIndex: lastIncludedIndex,
+		}
+	}()
+
+}
+
+// encode: currentTerm, votedFor, entries
 func (rf *Raft) encode() []byte {
 	w := &bytes.Buffer{}
 	e := labgob.NewEncoder(w)
@@ -217,6 +218,21 @@ func (rf *Raft) encode() []byte {
 func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int, snapshot []byte) bool {
 
 	// Your code here (2D).
+
+	if lastIncludedIndex <= rf.commitIndex {
+		return false
+	}
+	if lastIncludedIndex > rf.log.lastEntry().Index {
+		//占据entries切片中下标为0的位置，始终得保持entries不为空
+		rf.log.entries = make([]Entry, 1)
+	} else {
+		rf.log.entries = rf.log.entries[lastIncludedIndex-rf.log.firstEntry().Index:]
+	}
+	rf.log.entries[0].Index, rf.log.entries[0].Term, rf.log.entries[0].Command =
+		lastIncludedIndex, lastIncludedTerm, nil
+
+	rf.commitIndex, rf.lastApplied = lastIncludedIndex, lastIncludedIndex
+	rf.persister.SaveStateAndSnapshot(rf.encode(), snapshot)
 
 	return true
 }
@@ -269,19 +285,19 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		reply.Message = Format("Don't need snapshot. args.LastIncludedIndex(%v)<=rf.commitIndex(%v)", args.LastIncludedIndex, rf.commitIndex)
 		return
 	}
-	if args.LastIncludedIndex > rf.log.lastEntry().Index {
-		//占据entries切片中下标为0的位置，始终得保持entries不为空
-		rf.log.entries = make([]Entry, 1)
-	} else {
-		rf.log.entries = rf.log.entries[args.LastIncludedIndex-rf.log.firstEntry().Index:]
-	}
-	rf.log.entries[0].Index, rf.log.entries[0].Term, rf.log.entries[0].Command =
-		args.LastIncludedIndex, args.LastIncludedTerm, nil
-
-	rf.commitIndex, rf.lastApplied = args.LastIncludedIndex, args.LastIncludedIndex
-	rf.persister.SaveStateAndSnapshot(rf.encode(), args.Data)
-
-	reply.Message = Format("firstEntry:%v", rf.log.firstEntry())
+	//if args.LastIncludedIndex > rf.log.lastEntry().Index {
+	//	//占据entries切片中下标为0的位置，始终得保持entries不为空
+	//	rf.log.entries = make([]Entry, 1)
+	//} else {
+	//	rf.log.entries = rf.log.entries[args.LastIncludedIndex-rf.log.firstEntry().Index:]
+	//}
+	//rf.log.entries[0].Index, rf.log.entries[0].Term, rf.log.entries[0].Command =
+	//	args.LastIncludedIndex, args.LastIncludedTerm, nil
+	//
+	//rf.commitIndex, rf.lastApplied = args.LastIncludedIndex, args.LastIncludedIndex
+	//rf.persister.SaveStateAndSnapshot(rf.encode(), args.Data)
+	//
+	//reply.Message = Format("firstEntry:%v", rf.log.firstEntry())
 
 	//apply
 	go func() {
@@ -293,23 +309,6 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 			SnapshotIndex: args.LastIncludedIndex,
 		}
 	}()
-}
-
-type AppendEntriesArgs struct {
-	Term         int
-	LeaderId     int
-	PreLogIndex  int
-	PreLogTerm   int
-	Entries      []Entry //empty for heartbeat
-	LeaderCommit int     //leader's CommitIndex
-}
-
-// AppendEntriesReply 每一个RPC请求必须用不同的reply，否则labgob会有警告(labgob:169)：labgob warning: Decoding into a ...
-type AppendEntriesReply struct {
-	Term      int
-	NextIndex int
-	Success   bool
-	Message   string
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -423,44 +422,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}()
 }
 
-// RequestVoteArgs
-// example RequestVote RPC arguments structure.
-// field names must start with capital letters!
-//
-type RequestVoteArgs struct {
-	// Your data here (2A, 2B).
-	Term         int // candidate term
-	CandidateId  int
-	LastLogIndex int
-	LastLogTerm  int
-}
-
-// RequestVoteReply
-// example RequestVote RPC reply structure.
-// field names must start with capital letters!
-//
-type RequestVoteReply struct {
-	// Your data here (2A).
-	Term        int  //currentTerm, for candidate to update itself
-	VoteGranted bool //true means candidate received vote
-	Message     string
-}
-
-type InstallSnapshotArgs struct {
-	Term              int
-	LeaderId          int
-	LastIncludedIndex int
-	LastIncludedTerm  int
-	Offset            int
-	Data              []byte
-	Done              bool
-}
-
-type InstallSnapshotReply struct {
-	Term    int
-	Message string
-}
-
 // RequestVote
 // example RequestVote RPC handler.
 //
@@ -553,7 +514,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// 应该立即发送一轮广播，否则在Lab 3A的TestSpeed3A会超时，报错：test_test.go:421: Operations completed too slowly 129.23ms/op > 33.333333ms/op
 	// 这个时间和我设置的一轮heartbeat的时间相近
 	// todo 立马heartbeat似乎不是最好的方式，我觉得应该等待大致30ms后，这样可以累计一定的entry后再进行同步
-	go rf.broadcastHeartbeat()
+	//go rf.broadcastHeartbeat()
 
 	return entry.Index, entry.Term, true
 }
@@ -684,11 +645,12 @@ func (rf *Raft) sendAppendEntries(peer int, ctx context.Context, cancelFunc cont
 	// 一方面是因为在newAppendEntriesArgs方法中发送的entries的范围是[nextIndex-firstIndex : ]，
 	// 另一方面，如果follower的nextIndex <= firstIndex，即这个follower还没有catch up leader的snapshot，
 	// 则leader需要发送snapshot，先让这个follower跟上节奏
+	rf.mu.RLock()
 	if rf.nextIndex[peer] <= rf.log.firstEntry().Index {
 		go rf.sendInstallSnapshot(peer, ctx, cancelFunc)
+		rf.mu.RUnlock()
 		return
 	}
-	rf.mu.RLock()
 	args, _ := rf.newAppendEntriesArgs(peer) // 细节，这两个变量得放在协程里边，不然args会串味：args是个指针，存的是地址，下一个peer也会改变这个args， 然而每个peer的args是私人定制的
 	rf.mu.RUnlock()
 	reply := &AppendEntriesReply{}
@@ -734,6 +696,7 @@ func (rf *Raft) sendAppendEntries(peer int, ctx context.Context, cancelFunc cont
 	//若此时reply.Success为false，且reply.Term == rf.currentTerm（reply的那个节点同样拥有最新的term），
 	//那么将会再次调用sendAppendEntries
 	if Leader != rf.state { //hold invariants
+		cancelFunc()
 		return
 	}
 	if reply.Success { //true
@@ -753,7 +716,7 @@ func (rf *Raft) sendAppendEntries(peer int, ctx context.Context, cancelFunc cont
 			return
 		}
 		rf.nextIndex[peer] = reply.NextIndex
-		go rf.sendAppendEntries(peer, ctx, cancelFunc)
+		//go rf.sendAppendEntries(peer, ctx, cancelFunc)
 	}
 }
 
@@ -826,6 +789,7 @@ func (rf *Raft) sendRequestVote(peer int, args *RequestVoteArgs, voteCh chan<- b
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	if Candidate != rf.state {
+		cancelFunc()
 		return
 	}
 	if reply.VoteGranted {
@@ -885,6 +849,7 @@ func (rf *Raft) sendInstallSnapshot(peer int, ctx context.Context, cancelFunc co
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	if Leader != rf.state { //hold invariant
+		cancelFunc()
 		return
 	}
 	if reply.Term > rf.currentTerm {
@@ -896,10 +861,10 @@ func (rf *Raft) sendInstallSnapshot(peer int, ctx context.Context, cancelFunc co
 		rf.persist()
 		return
 	}
-	rf.nextIndex[peer] = rf.log.firstEntry().Index + 1
-	rf.matchIndex[peer] = rf.log.firstEntry().Index + 1
+	rf.nextIndex[peer] = args.LastIncludedIndex + 1
+	rf.matchIndex[peer] = args.LastIncludedIndex
 	DPrintf("(peer=%v, term=%v)snapshot installed, then send appendEntries", peer, reply.Term)
-	go rf.sendAppendEntries(peer, ctx, cancelFunc)
+	//go rf.sendAppendEntries(peer, ctx, cancelFunc)
 }
 
 // The ticker go routine starts a new election if this peer hasn't received
@@ -931,20 +896,19 @@ func (rf *Raft) ticker() {
 func (rf *Raft) applier() {
 	for !rf.killed() {
 		<-rf.notifyApplyCh
-		rf.mu.RLock()
+		rf.mu.Lock()
 		if rf.lastApplied >= rf.commitIndex {
 			rf.mu.Unlock()
 			continue
 		}
-		commitIndex, lastApplied := rf.commitIndex, rf.lastApplied
-		firstIndex := rf.log.firstEntry().Index
+		firstIndex, commitIndex, lastApplied := rf.log.firstEntry().Index, rf.commitIndex, rf.lastApplied
 		// 这个长度有点坑，区间应该是[lastApplied+1, commitIndex]，于是len应该是(lastApplied+1-commitIndex)+1，两个1抵消
 		entries := make([]Entry, commitIndex-lastApplied)
 		// 不论如何还是需要减去firstIndex，有可能因为覆盖等原因第一个entry不再是(0,0,nil)
 		//因为没有减去firstIndex，让我在TestFailNoAgree2B上debug了很久
 		copy(entries, rf.log.entries[lastApplied+1-firstIndex:commitIndex+1-firstIndex])
 		rf.lastApplied = Max(rf.lastApplied, rf.commitIndex)
-		rf.mu.RUnlock()
+		rf.mu.Unlock()
 
 		for _, entry := range entries {
 			rf.applyCh <- ApplyMsg{
@@ -980,7 +944,7 @@ func (rf *Raft) newAppendEntriesArgs(peer int) (*AppendEntriesArgs, int) {
 	nextIndex := rf.nextIndex[peer]
 	preLogIndex := nextIndex - 1
 	if preLogIndex < firstIndex {
-		_ = fmt.Sprintf("【temp error】preLogIndex=%v, firstIndex=%v", preLogIndex, firstIndex)
+		panic(Format("【panic】preLogIndex=%v, firstIndex=%v", preLogIndex, firstIndex))
 	}
 	preLogTerm := rf.log.entries[preLogIndex-firstIndex].Term // 特别强调一下取entry时候的索引，需要减去firstIndex
 
