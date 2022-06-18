@@ -1,6 +1,18 @@
 package kvraft
 
-import "time"
+import (
+	"log"
+	"time"
+)
+
+const Debug = false
+
+func DPrintf(format string, a ...interface{}) (n int, err error) {
+	if Debug {
+		log.Printf(format, a...)
+	}
+	return
+}
 
 const (
 	OK             = "OK"
@@ -28,10 +40,23 @@ type Reply struct {
 	Err   Err
 }
 
-func RPCTimeOut() time.Duration {
+func ExecutionTimeOut() time.Duration {
 	return 500 * time.Millisecond
 }
 
-func ExecutionTimeOut() time.Duration {
-	return 500 * time.Millisecond
+type Op struct {
+	// Your definitions here.
+	// Field names must start with capital letters,
+	// otherwise RPC will break.
+	ClientId    int64
+	SequenceNum int64
+	Key         string
+	Value       string
+	Method      string
+}
+
+type Session struct {
+	ClientId          int64
+	LatestSequenceNum int64
+	Reply             Reply
 }

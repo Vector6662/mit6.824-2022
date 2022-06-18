@@ -5,37 +5,10 @@ import (
 	"6.824/labrpc"
 	"6.824/raft"
 	"bytes"
-	"log"
 	"sync"
 	"sync/atomic"
 	"time"
 )
-
-const Debug = false
-
-func DPrintf(format string, a ...interface{}) (n int, err error) {
-	if Debug {
-		log.Printf(format, a...)
-	}
-	return
-}
-
-type Op struct {
-	// Your definitions here.
-	// Field names must start with capital letters,
-	// otherwise RPC will break.
-	ClientId    int64
-	SequenceNum int64
-	Key         string
-	Value       string
-	Method      string
-}
-
-type Session struct {
-	ClientId          int64
-	LatestSequenceNum int64
-	Reply             Reply
-}
 
 type KVServer struct {
 	mu      sync.RWMutex
@@ -51,8 +24,6 @@ type KVServer struct {
 	clientSession map[int64]Session
 	data          Data
 	notifyChanMap map[int]chan Reply
-
-	lastApplied int
 }
 
 func (kv *KVServer) applier() {
@@ -61,16 +32,11 @@ func (kv *KVServer) applier() {
 		if applyMsg.CommandValid {
 			var reply Reply
 			if applyMsg.Command == nil {
+				//println("command nil")
 				continue
-				print("")
 			}
 			commandIndex, op := applyMsg.CommandIndex, applyMsg.Command.(Op)
 			kv.mu.Lock()
-			if commandIndex <= kv.lastApplied {
-				kv.mu.Unlock()
-				continue
-			}
-			kv.lastApplied = commandIndex
 			if GET != op.Method && kv.isDuplicate(op.ClientId, op.SequenceNum) {
 				reply = kv.clientSession[op.ClientId].Reply
 			} else {
@@ -90,29 +56,20 @@ func (kv *KVServer) applier() {
 					}
 				}
 			}
-			// todo $8提到了实现读一致性：“第二，需要保证自己仍然是leader才能处理读请求“
 			if currentTerm, isLeader := kv.rf.GetState(); isLeader && currentTerm == applyMsg.CommandTerm {
 				kv.notifyChanMap[commandIndex] <- reply
 			}
-			//todo snapshot
 			kv.snapshot(commandIndex)
 			kv.mu.Unlock()
 		} else if applyMsg.SnapshotValid {
-			// todo snapshot
 			kv.mu.Lock()
-			if kv.rf.CondInstallSnapshot(applyMsg.SnapshotTerm, applyMsg.SnapshotIndex, applyMsg.Snapshot) {
-				kv.readSnapshot(applyMsg.Snapshot)
-				kv.lastApplied = applyMsg.SnapshotIndex
-			}
+			kv.readSnapshot(applyMsg.Snapshot)
 			kv.mu.Unlock()
 		}
 	}
 }
 
 func (kv *KVServer) RPC(args *Args, reply *Reply) {
-	// todo 我自己的逻辑一直有bug，但我还没找到是啥问题。下边的代码参照了这里的逻辑：https://github.com/OneSizeFitsQuorum/MIT6.824-2021/blob/master/docs/lab3.md
-	//
-
 	op := Op{ //感觉这么做duck不必啊，反正字段和args都一毛一样
 		ClientId:    args.ClientId,
 		SequenceNum: args.SequenceNum,
@@ -154,14 +111,17 @@ func (kv *KVServer) isDuplicate(clientId, sequenceNum int64) bool {
 	return session.LatestSequenceNum >= sequenceNum
 }
 
+// check if need snapshot, then install snapshot
 func (kv *KVServer) snapshot(index int) {
+	// check whether necessary
 	if kv.maxraftstate == -1 || kv.persister.RaftStateSize() < kv.maxraftstate {
 		return
 	}
 	w := &bytes.Buffer{}
 	e := labgob.NewEncoder(w)
-	_ = e.Encode(kv.data)
-	_ = e.Encode(kv.clientSession)
+	if e.Encode(kv.data) != nil || e.Encode(kv.clientSession) != nil {
+		panic("encode err")
+	}
 	kv.rf.Snapshot(index, w.Bytes())
 }
 
@@ -171,11 +131,14 @@ func (kv *KVServer) readSnapshot(snapshot []byte) {
 	}
 	r := bytes.NewBuffer(snapshot)
 	d := labgob.NewDecoder(r)
+
+	var lastIncludedIndex, lastIncludedTerm int // 这两个变量在snapshot中是没有用处的，但是需要先解析这俩才能够解析到后边的data和clientSession
 	var data Data
 	var clientSession map[int64]Session
 
-	d.Decode(&data)
-	d.Decode(&clientSession)
+	if d.Decode(&lastIncludedIndex) != nil || d.Decode(&lastIncludedTerm) != nil || d.Decode(&data) != nil || d.Decode(&clientSession) != nil {
+		panic("decode err")
+	}
 	kv.data, kv.clientSession = data, clientSession
 }
 
@@ -226,7 +189,6 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	// You may need initialization code here.
 
 	kv.applyCh = make(chan raft.ApplyMsg)
-	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 	kv.persister = persister
 
 	// You may need initialization code here.
@@ -234,8 +196,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.notifyChanMap = make(map[int]chan Reply)
 	kv.clientSession = make(map[int64]Session)
 
-	kv.lastApplied = 0
-	kv.readSnapshot(persister.ReadSnapshot())
+	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 	go kv.applier()
 
 	return kv

@@ -129,12 +129,12 @@ func (rf *Raft) GetState() (int, bool) {
 // where it can later be retrieved after a crash and restart.
 // see paper's Figure 2 for a description of what should be persistent.
 //
-func (rf *Raft) persist() {
-	rf.persister.SaveRaftState(rf.encode())
+func (rf *Raft) persistRaftState() {
+	rf.persister.SaveRaftState(rf.encodeRaftState())
 }
 
 //
-// restore previously persisted state.
+// reload previously persisted raft state.
 //
 func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
@@ -145,36 +145,32 @@ func (rf *Raft) readPersist(data []byte) {
 	d := labgob.NewDecoder(r)
 	var currentTerm, votedFor int
 	var entries []Entry
-	e1, e2, e3 := d.Decode(&currentTerm), d.Decode(&votedFor), d.Decode(&entries)
-	if e1 != nil || e2 != nil || e3 != nil {
-		_ = fmt.Errorf("【Decode err, e1:%v, e2:%v, e3:%v】", e1, e2, e3)
-	} else {
-		rf.currentTerm, rf.votedFor, rf.log.entries = currentTerm, votedFor, entries
-		if len(entries) == 0 {
-			rf.log.appendOne(emptyEntry)
-		}
-		//细节，在reboot之后也是需要初始化的两个变量，这两个变量属于Volatile state on all servers
-		//忽略了这个，让我在TestSnapshotInstallCrash2D没有通过
-		rf.commitIndex, rf.lastApplied = rf.log.firstEntry().Index, rf.log.firstEntry().Index
+
+	if d.Decode(&currentTerm) != nil || d.Decode(&votedFor) != nil || d.Decode(&entries) != nil {
+		panic("error decode")
 	}
+	rf.currentTerm, rf.votedFor, rf.log.entries = currentTerm, votedFor, entries
+	if len(entries) == 0 {
+		rf.log.appendOne(emptyEntry)
+	}
+	//细节，在reboot之后也是需要初始化的两个变量，这两个变量属于Volatile state on all servers
+	//忽略了这个，让我在TestSnapshotInstallCrash2D没有通过
+	rf.commitIndex, rf.lastApplied = rf.log.firstEntry().Index, rf.log.firstEntry().Index
 }
 
-func (rf *Raft) readSnapshot(data []byte) {
-	if data == nil || len(data) < 1 {
+func (rf *Raft) readSnapshot(snapshot []byte) {
+	if snapshot == nil || len(snapshot) < 1 {
 		return
 	}
 
-	r := bytes.NewBuffer(data)
+	r := bytes.NewBuffer(snapshot)
 	d := labgob.NewDecoder(r)
 
 	var lastIncludedIndex, lastIncludedTerm int
-	_ = d.Decode(&lastIncludedIndex)
-	_ = d.Decode(&lastIncludedTerm)
-
-	if lastIncludedIndex <= rf.commitIndex {
-		return
+	if d.Decode(&lastIncludedIndex) != nil || d.Decode(&lastIncludedTerm) != nil {
+		panic("【error decode】")
 	}
-
+	//truncate entries
 	if lastIncludedIndex > rf.log.lastEntry().Index {
 		//占据entries切片中下标为0的位置，始终得保持entries不为空
 		rf.log.entries = make([]Entry, 1)
@@ -191,7 +187,7 @@ func (rf *Raft) readSnapshot(data []byte) {
 		rf.applyCh <- ApplyMsg{
 			CommandValid:  false,
 			SnapshotValid: true,
-			Snapshot:      data,
+			Snapshot:      snapshot,
 			SnapshotTerm:  lastIncludedTerm,
 			SnapshotIndex: lastIncludedIndex,
 		}
@@ -200,13 +196,13 @@ func (rf *Raft) readSnapshot(data []byte) {
 }
 
 // encode: currentTerm, votedFor, entries
-func (rf *Raft) encode() []byte {
+func (rf *Raft) encodeRaftState() []byte {
 	w := &bytes.Buffer{}
 	e := labgob.NewEncoder(w)
 	entries := make([]Entry, len(rf.log.entries))
 	copy(entries, rf.log.entries)
 	if e.Encode(rf.currentTerm) != nil || e.Encode(rf.votedFor) != nil || e.Encode(entries) != nil {
-		_ = fmt.Errorf("【Encode err】")
+		panic("encode err")
 	}
 	return w.Bytes()
 }
@@ -218,21 +214,6 @@ func (rf *Raft) encode() []byte {
 func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int, snapshot []byte) bool {
 
 	// Your code here (2D).
-
-	if lastIncludedIndex <= rf.commitIndex {
-		return false
-	}
-	if lastIncludedIndex > rf.log.lastEntry().Index {
-		//占据entries切片中下标为0的位置，始终得保持entries不为空
-		rf.log.entries = make([]Entry, 1)
-	} else {
-		rf.log.entries = rf.log.entries[lastIncludedIndex-rf.log.firstEntry().Index:]
-	}
-	rf.log.entries[0].Index, rf.log.entries[0].Term, rf.log.entries[0].Command =
-		lastIncludedIndex, lastIncludedTerm, nil
-
-	rf.commitIndex, rf.lastApplied = lastIncludedIndex, lastIncludedIndex
-	rf.persister.SaveStateAndSnapshot(rf.encode(), snapshot)
 
 	return true
 }
@@ -253,7 +234,17 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 
 	rf.log.entries = rf.log.entries[index-firstIndex:]
 	rf.log.entries[0].Command = nil // 单纯为了节约空间
-	rf.persister.SaveStateAndSnapshot(rf.encode(), snapshot)
+
+	w := &bytes.Buffer{}
+	e := labgob.NewEncoder(w)
+	// encode lastIncludedIndex, lastIncludedTerm
+	if e.Encode(rf.log.entries[0].Index) != nil || e.Encode(rf.log.entries[0].Term) != nil {
+		panic(Format("【Encode err】"))
+	}
+	data := w.Bytes()
+	data = append(data, snapshot...)
+
+	rf.persister.SaveStateAndSnapshot(rf.encodeRaftState(), data)
 }
 func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
 	rf.mu.Lock()
@@ -275,29 +266,24 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	}
 	if args.Term > rf.currentTerm {
 		rf.currentTerm, rf.votedFor = args.Term, -1
-		rf.persist()
+		rf.persistRaftState()
 	}
 	rf.changeState(Follower)
 	rf.electionTimer.Reset(ElectionTimeOut())
 
-	//此处参考：https://github.com/OneSizeFitsQuorum/MIT6.824-2021/blob/master/docs/lab2.md#%E6%97%A5%E5%BF%97%E5%8E%8B%E7%BC%A9
-	if args.LastIncludedIndex <= rf.commitIndex {
-		reply.Message = Format("Don't need snapshot. args.LastIncludedIndex(%v)<=rf.commitIndex(%v)", args.LastIncludedIndex, rf.commitIndex)
-		return
+	if args.LastIncludedIndex > rf.log.lastEntry().Index {
+		//占据entries切片中下标为0的位置，始终得保持entries不为空
+		rf.log.entries = make([]Entry, 1)
+	} else {
+		rf.log.entries = rf.log.entries[args.LastIncludedIndex-rf.log.firstEntry().Index:]
 	}
-	//if args.LastIncludedIndex > rf.log.lastEntry().Index {
-	//	//占据entries切片中下标为0的位置，始终得保持entries不为空
-	//	rf.log.entries = make([]Entry, 1)
-	//} else {
-	//	rf.log.entries = rf.log.entries[args.LastIncludedIndex-rf.log.firstEntry().Index:]
-	//}
-	//rf.log.entries[0].Index, rf.log.entries[0].Term, rf.log.entries[0].Command =
-	//	args.LastIncludedIndex, args.LastIncludedTerm, nil
-	//
-	//rf.commitIndex, rf.lastApplied = args.LastIncludedIndex, args.LastIncludedIndex
-	//rf.persister.SaveStateAndSnapshot(rf.encode(), args.Data)
-	//
-	//reply.Message = Format("firstEntry:%v", rf.log.firstEntry())
+	rf.log.entries[0].Index, rf.log.entries[0].Term, rf.log.entries[0].Command =
+		args.LastIncludedIndex, args.LastIncludedTerm, nil
+
+	rf.commitIndex, rf.lastApplied = args.LastIncludedIndex, args.LastIncludedIndex
+	rf.persister.SaveStateAndSnapshot(rf.encodeRaftState(), args.Data)
+
+	reply.Message = Format("firstEntry:%v", rf.log.firstEntry())
 
 	//apply
 	go func() {
@@ -314,7 +300,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	defer rf.persist()
+	defer rf.persistRaftState()
 
 	//log
 	{
@@ -429,7 +415,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	//Your code here (2A, 2B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	defer rf.persist() //两个地方要改变currentTerm和voteFor，干脆就在这里统一处理了
+	defer rf.persistRaftState() //两个地方要改变currentTerm和voteFor，干脆就在这里统一处理了
 
 	//log
 	{
@@ -507,13 +493,12 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	//不必进行checkEntry
 
 	rf.log.appendOne(entry)
-	rf.persist()
+	rf.persistRaftState()
 	DPrintf("<><><>Leader Receive Entry<><><>  leader(me=%v,state=%v,term=%v) entry(index=%v,term=%v,command=%v)",
 		rf.me, rf.state, rf.currentTerm, entry.Index, entry.Term, entry.Command)
 
-	// 应该立即发送一轮广播，否则在Lab 3A的TestSpeed3A会超时，报错：test_test.go:421: Operations completed too slowly 129.23ms/op > 33.333333ms/op
+	// 可能需要立即发送一轮广播，否则在Lab 3A的TestSpeed3A会超时，报错：test_test.go:421: Operations completed too slowly 129.23ms/op > 33.333333ms/op
 	// 这个时间和我设置的一轮heartbeat的时间相近
-	// todo 立马heartbeat似乎不是最好的方式，我觉得应该等待大致30ms后，这样可以累计一定的entry后再进行同步
 	//go rf.broadcastHeartbeat()
 
 	return entry.Index, entry.Term, true
@@ -583,7 +568,7 @@ func (rf *Raft) startElection() {
 	defer cancelFunc()
 
 	rf.currentTerm, rf.votedFor = rf.currentTerm+1, rf.me
-	rf.persist()
+	rf.persistRaftState()
 	rf.changeState(Candidate)
 	args := rf.newRequestVoteArgs()
 	rf.mu.Unlock()
@@ -712,7 +697,7 @@ func (rf *Raft) sendAppendEntries(peer int, ctx context.Context, cancelFunc cont
 			// 注意还要改变votedFor=-1!!!这是一个大坑！！！
 			// 表明已经知晓现在的任期号增加了，但是谁是该任期的leader还需要等待投票决定
 			rf.currentTerm, rf.votedFor = reply.Term, -1
-			rf.persist()
+			rf.persistRaftState()
 			return
 		}
 		rf.nextIndex[peer] = reply.NextIndex
@@ -799,7 +784,7 @@ func (rf *Raft) sendRequestVote(peer int, args *RequestVoteArgs, voteCh chan<- b
 		voteCh <- false
 		rf.changeState(Follower)
 		rf.currentTerm, rf.votedFor = reply.Term, -1
-		rf.persist()
+		rf.persistRaftState()
 	}
 }
 
@@ -858,7 +843,7 @@ func (rf *Raft) sendInstallSnapshot(peer int, ctx context.Context, cancelFunc co
 		// 注意还要改变votedFor=-1!!!这是一个大坑！！！
 		// 表明已经知晓现在的任期号增加了，但是谁是该任期的leader还需要等待投票决定
 		rf.currentTerm, rf.votedFor = reply.Term, -1
-		rf.persist()
+		rf.persistRaftState()
 		return
 	}
 	rf.nextIndex[peer] = args.LastIncludedIndex + 1
@@ -1040,6 +1025,7 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+	rf.readSnapshot(persister.ReadSnapshot())
 
 	// start ticker goroutine to start elections
 	go rf.ticker()

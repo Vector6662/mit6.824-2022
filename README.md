@@ -10,7 +10,7 @@ Lab 2:
 Lab 3:
 
 - [x] 2A
-- [ ] 2B
+- [x] 2B
 
 ---
 
@@ -289,5 +289,26 @@ TestSpeed3A会超时，报错：
 
 这个时间其实差不多和设置的一轮heartbeat的时间相近。也就是说每次调用`Start()`后并不会马上去同步，而是等待下一轮heartbeat才会同步，实际上应该在收到entry后立即广播。但这虽然大大提高了可用性（2.3s就过了，官方给的时间15.7），但似乎更好的做法是应该累计一定的entry后再广播，比如等待30ms。
 
+这个问题我耗费了很长时间进行处理，如果是收到entry后立即广播，那么将会产生巨量的AppendEntries RPC，这显然是不可行的。然后我将心跳超时时间设置成了21ms，这个测试点能够通过，但是引发的问题是Lab 2B中的TestCount2B又过不了了：
+
+> test_test.go:677: too many RPCs (64) for 1 second of idleness
+
+现在知道的思路是，每一轮AppendEntries RPC结束后，如果有新的entries加入，便**立即**进行下一轮，换句话说，同一时刻只存在一轮AppendEntries RPC，这样应该就可以同时解决上边的两个报错。
+
+至于如何实现暂时还没有很好的思路，倒是看了下[这里](https://github.com/OneSizeFitsQuorum/MIT6.824-2021/blob/master/docs/lab2.md#%E5%A4%8D%E5%88%B6%E6%A8%A1%E5%9E%8B)的实现，用到了condition，我在想能不能直接使用通道来实现？
+
 ### 2B
 
+这部分我觉得思路不是很复杂，但是花费了我很长很长的时间，找bug那段时间（大概整整一周）我一度准备放弃。最后大概是老天垂怜，让我无意间发现了在Lab 2期间忽视的一个点：`applier()`中有这么一行：
+
+```go
+rf.lastApplied = Max(rf.lastApplied, rf.commitIndex)
+```
+
+意思是更新`lastApplied`，显然是要加写锁的，但是我当时实现的时候不知咋滴，加的是读锁😭！这导致了我跑test的时候老是fail，出现一些奇奇怪怪的问题。
+
+这部分的实现思路总结一下，分为安装snapshot和持久化snapshot。
+
+安装snapshot有两个地方：一是来自leader的，也就是被调用InstallSnapshot RPC，其次是本地server reboot，对应的方法是`raft#readSnapshot(...)`。这两个方法流程大同小异，本质都是raft层truncate entries，然后将snapshot**通过通道**（`rf.applyCh`）提交给server层，让server 层自己安装snapshot。也就是说，server层安装snapshot都是通过`applyCh`通道，在server层收到消息之前是能确保raft层已经对entries truncate完毕了。
+
+持久化snapshot的过程类似上边的过程倒过来：先server持久化（`kv.snapshot(...)`），然后让raft层truncate entries，最后持久化raft state。
