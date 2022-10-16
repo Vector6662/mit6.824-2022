@@ -18,13 +18,11 @@ Lab 3:
 
 # Lab 2
 
-## 参考
+参考资料：
 
 1. [[译] [论文] Raft 共识算法（及 etcd/raft 源码解析）（USENIX, 2014）](http://arthurchiao.art/blog/raft-paper-zh/)
 2. [一文搞懂Raft算法](https://www.cnblogs.com/xybaby/p/10124083.html)：里边对限制5.4.2讲解是非常到位的
 3. https://raft.github.io/：动画
-4. [OneSizeFitsQuorum/MIT6.824-2021](https://github.com/OneSizeFitsQuorum/MIT6.824-2021)
-5. [yzongyue/6.824-golabs-2020](https://github.com/yzongyue/6.824-golabs-2020)
 
 ## 理解5.4 safety
 
@@ -47,7 +45,7 @@ if lastTerm > args.LastLogTerm || (lastTerm == args.LastLogTerm && lastIndex > a
 
 这里再简单提及一下在cluster membership changes也有一个选举限制，为了避免被移除节点的干扰（三个问题之一），只有在节点选举超时（即成为candidate时） 的时候，才会处理RequestVote RPC，否则忽略此RPC。这是为了避免被移除节点（不在C~new~中的节点）的干扰。
 
-#### 5.4.2 提交限制：当前Term+过半提交
+#### 5.4.2 提交限制：当前Term+过半提交（figure 8典中典）
 
 ![img](README.assets/1089769-20181216202438174-260853001.png)
 
@@ -257,9 +255,9 @@ send/receive通道的上下文尽量不要占有锁，否则会极大影响并�
 
 ## 论文中线性==读==的实现方式
 
-论文中client interaction章节的线性写比较好理解，但如何避免读取**过时数据**（stale data），以实现线性读不是很理解。这里记录一下提到的两种预防措施（precaution）。
+论文Client Interaction章节的线性写比较好理解，但如何避免读取**过时数据**（stale data），以实现线性读不是很理解。这里记录一下提到的两种预防措施（precaution）。
 
-第一个预防措施：
+##### 预防措施一
 
 > First, a leader must have the latest information on which entries are committed.
 
@@ -292,9 +290,7 @@ for peer := range rf.peers {
 
 这玩意儿也用在了单步成员变更中有涉及，为了解决其中的[正确性问题](https://zhuanlan.zhihu.com/p/359206808)。
 
-
-
-第二个预防措施：
+##### 预防措施二
 
 > Second, a leader must check whether it has been **deposed** before processing a read-only request
 
@@ -336,21 +332,21 @@ if currentTerm, isLeader := kv.rf.GetState(); isLeader && currentTerm == applyMs
 
 concurrent情况下，每一个request需要带上最大已经收到的序列号，或者如原文中说的尚未收到response的最小序列号。
 
-
+### 解决TestSpeed3A超时的历程
 
 TestSpeed3A会超时，报错：
 
-> test_test.go:421: Operations completed too slowly 129ms/op > 33.333333ms/op（大致是这个时间，忘截图了）
+> test_test.go:421: Operations completed too slowly 129ms/op > 33.333333ms/op
 
-这个时间其实差不多和设置的一轮heartbeat的时间相近。也就是说每次调用`Start()`后并不会马上去同步，而是等待下一轮heartbeat才会同步，实际上应该在收到entry后立即广播。但这虽然大大提高了可用性（2.3s就过了，官方给的时间15.7），但似乎更好的做法是应该累计一定的entry后再广播，比如等待30ms。
+这个时间其实差不多和设置的一轮heartbeat的时间相近。也就是说每次调用`Start()`后并不会马上去同步，而是等待下一轮heartbeat才会同步，这样做显然在可用性上很拉跨。实际上，应该在收到entry后立即广播，但这虽然大大提高了可用性（2.3s就过了，官方给的时间15.7s），但这会产生巨量并发的AppendEntries RPC。似乎更好的做法是应该累计一定的entry后再广播，比如等待30ms。我也这样尝试了一下，但发现了下边描述的问题。
 
-这个问题我耗费了很长时间进行处理，如果是收到entry后立即广播，那么将会产生巨量的AppendEntries RPC，这显然是不可行的。然后我将心跳超时时间设置成了21ms，这个测试点能够通过，但是引发的问题是Lab 2B中的TestCount2B又过不了了：
+我将心跳超时时间设置成了21ms，这个测试点能够通过，但Lab 2B中的TestCount2B又过不了了：
 
 > test_test.go:677: too many RPCs (64) for 1 second of idleness
 
-现在知道的思路是，每一轮AppendEntries RPC结束后，如果有新的entries加入，便**立即**进行下一轮，换句话说，同一时刻只存在一轮AppendEntries RPC，这样应该就可以同时解决上边的两个报错。
+后来又想到一个思路：一次AppendEntries RPC结束后，如果有新的entries加入，便**立即**进行一轮AppendEntries RPC，**然后阻塞掉这个RPC**，等这次RPC完成后释放掉锁，进行下一轮RPC。也就是说，同一时刻只存在一轮AppendEntries RPC，这样应该就可以同时解决上边的两个报错。
 
-至于如何实现暂时还没有很好的思路，倒是看了下[这里](https://github.com/OneSizeFitsQuorum/MIT6.824-2021/blob/master/docs/lab2.md#%E5%A4%8D%E5%88%B6%E6%A8%A1%E5%9E%8B)的实现，用到了condition，我在想能不能直接使用通道来实现？
+至于如何实现暂时还没有很好的思路，倒是看了下[这里](https://github.com/OneSizeFitsQuorum/MIT6.824-2021/blob/master/docs/lab2.md#%E5%A4%8D%E5%88%B6%E6%A8%A1%E5%9E%8B)的实现，用到了condition，但我想直接用channel来实现，但还没有很好的思路。
 
 
 
@@ -362,7 +358,7 @@ TestSpeed3A会超时，报错：
 rf.lastApplied = Max(rf.lastApplied, rf.commitIndex)
 ```
 
-意思是更新`lastApplied`，显然是要加写锁的，但是我当时实现的时候不知咋滴，加的是读锁😭！这导致了我跑test的时候老是fail，出现一些奇奇怪怪的问题。
+意思是更新`lastApplied`，显然是要加写锁的，但是我当时实现的时候不知咋滴，加的是读锁😭！这导致了我跑test的时候时不时就fail，出现一些奇奇怪怪的问题。
 
 这部分的实现思路总结一下，分为安装snapshot和持久化snapshot。
 
@@ -371,6 +367,65 @@ rf.lastApplied = Max(rf.lastApplied, rf.commitIndex)
 持久化snapshot的过程类似上边的过程倒过来：先server持久化（`kv.snapshot(...)`），然后让raft层truncate entries，最后持久化raft state。
 
 
+
+# Replication方案学习—Chain Replication &Quorum
+
+### 外部权威—更通用的方案
+
+> 不管怎样，配合一个**外部权威**机构这种架构，我不确定是不是万能的，但的确是非常的通用。（来自[6.824翻译](https://mit-public-courses-cn-translatio.gitbook.io/mit6-824/lecture-09-more-replication-craq/9.7-lian-fu-zhi-de-pei-zhi-guan-li-qi-configuration-manager)）
+
+> 从集群的分布式模式来看，往往分布式的中心化存储，**其监控模式都推荐隔离开业务数据处理，形成独立管理者或者状态监控者**，例如：分布式文件系统HDFS的namenode、zookeeper**、**journalnode；MongoDB副本集模式中的仲裁；RocketMQ的nameserver；以及Redis的哨兵。（来自[知乎回答](https://www.zhihu.com/question/449535048/answer/1782590778)）
+
+### Chain Replication & CRAQ
+
+CRAQ和Chain Replication的区别感觉不是太大，CRAQ应该是提供了多版本的读，让复制链上所有的节点都可以处理读请求。
+
+
+
+### Quorum
+
+
+
+
+
+
+
+# Client Interaction学习—Zookeeper
+
+Raft主要解决的问题是fault tolerance，本身是不提供high performance的，甚至会恶化：follower只是愉快地执行leader交给的任务。
+
+Zookeeper作为Raft(准确来说是ZAB)之上的server，是为了能够提供high performance，基于一个事实：现实世界中，读请求是远多余写请求。
+
+提供了两个一致性保证：
+
+### Linearizable Write
+
+> 这里的意思是，尽管客户端可以并发的发送写请求，然后Zookeeper表现的就像以某种顺序，一次只执行一个写请求，并且也符合写请求的**实际时间**（total order）。
+
+### FIFO Client Order（管道机制）—保证读的顺序一致性
+
+这点比较难理解。我认为这是一种顺序一致性保证：虽然在client内部是并行的，但是发送给server的时候是串行的：请求以特定的顺序到达server（偏序）。非常类似HTTP1/1的管道机制！
+
+我猜测这里应该类似我raft中的实现，每一个请求发送时，都会携带下边的元组：`SequenceNum`，以递增的顺序发送给server。
+
+```go
+ClientId int64
+SequenceNum int64
+```
+
+这还不是重点，管道机制只是顺序一致性保障的第一步，难点在于：Leader负责写，副本负责读。这会带来下边的问题：
+
+假设client1先后（编程序/偏序）发送了两个请求：W~x,1~、R~x~，要保证W~x,1~的结果堆对R~x~可见。
+
+对此，Zookeeper对副本进行了约束：==client需要记住**最高zxid**，且请求时会带上。副本在没有获取到该zxid之前，不可响应client的（读）请求。==
+
+> 学生提问：zxid必须要等到写请求执行完成才返回吗？
+>
+> Robert教授：实际上，我不知道它具体怎么工作，但是这是个合理的假设。当我发送了异步的写请求，系统并没有执行这些请求，但是系统会回复我说，好的，我收到了你的写请求，**==如果==它最后commit了**，这将会是对应的zxid。所以这里是一个合理的假设，我实际上不知道这里怎么工作。之后如果客户端执行读请求，就可以告诉一个副本说，这个zxid是我之前发送的一个写请求。
+
+### 实现线性一致读—`sync()`
+
+非常有意思的实现，我觉得这是用了实现顺序一致性的方式来实现读的线性一致：“没有同步到该zxid前，不可响应”🤣。
 
 
 
@@ -434,3 +489,49 @@ rf.lastApplied = Max(rf.lastApplied, rf.commitIndex)
 
 > 当叛变者**不超过$$\frac{1}{3}$$时**，存在有效的算法，不论叛变者如何折腾，忠诚的将军们总能达成一致的结果。
 
+
+
+# linearizability vs sequential consistency
+
+## 全序和偏序
+
+总的来说，是**全序（total order）与偏序（partial order）**的区别。此观点来自于[这里](https://segmentfault.com/a/1190000022248118)。
+
+## 线性一致性：total order
+
+参考：[分布式系统一致性—*by YuanBao on April 21, 2018*](http://kaiyuan.me/2018/04/21/consistency-concept/)。
+
+> Linearizability 实际上刻画了我们对于分布式系统的非常自然的期望：
+>
+> - 每一个读操作都将返回==『最近的写操作』==（基于单一的==实际时间==）的值
+> - 系统中的所有进程，看到的操作顺序，都与全局时钟下的顺序一致
+
+“最近的写操作”反映了线性一致性和顺序一致性最根本的区别。
+
+顺序一致性只需要保证单个客户端的这种偏序关系。举个例子，**单个客户端A**，先后发送了两个请求：W~x,1~、R~x~，那么W~x,1~的结果对R~x~是可见的，此时满足顺序一致性。
+
+对于线性一致性，设**两个客户端A、B**，先后（实际时间的先后）发送两个请求：W~x,1~、R~x~。
+
+对于顺序一致性，不要求W~x,1~的结果对R~x~可见，毕竟在异步网络模型下，不能保证在实际时间先发送的请求能够比后发送的到达服务器。而在线性一致性下，必须要保证W~x,1~的结果对R~x~可见。这表示所有客户端都遵守的全序关系。
+
+下图便描述了一个不符合线性一致的场景：在P3以及读取到x=3的情况下，**说明 P3 的读操作是在 P1 的写操作生效点之后执行**。如果 “?” 处的值为0，便不符合线性一致。
+
+<img src="README.assets/inv_res3.png" alt="img" style="zoom:67%;" />
+
+## 顺序一致性：partial order
+
+参考：[什么是顺序一致性(Sequential Consistency)](https://lotabout.me/2019/QQA-What-is-Sequential-Consistency/)。顺序一致与CPU多级缓存，继续看此文章中的内容。
+
+> 如果**存在**一个所有 CPU 执行指令的排序（串行），**该排序中每个 CPU 要执行指令的顺序得以保持**，且实际的 CPU 执行结果（并行）与该指令排序的执行结果一致，则称该次执行达到了顺序一致性。
+
+上边用到的是CPU而不是线程、进程来描述的原因是，线性一致性最初并不是用在分布式场景下的，而是*shared-memory muti-processor system*。 
+
+顺序一致性更加契合实际，以编程序为准。“编程顺序”指的是：只要满足同一进程中指令的先后顺序即可。如下图P1，(W,2)的结果能够保证先于(W,3)即可，这也就是被称为偏序的原因：进程**局部**保证一致性即可。话句话说，顺序一致性能够保证单个客户端（局部）的线性一致。
+
+所以下边的两种情况存在一个执行顺序都能满足：`P1 x.write(2) -> P1 x.write(3) -> P2 x.write(5) -> P1 x.read(5)`。
+
+<img src="README.assets/sc_example.png" alt="img" style="zoom: 50%;" />
+
+这也是为啥我觉得线性一致性和数据库中的可串行化（Serializability）隔离级别相似的原因，看看可串行化的描述：存在一个串行的执行结果，和并行的执行结果相同。
+
+所以我认为Lab3实际实现的应该是顺序一致，因为我目前的实现并没有对所有的client做一个全局的约束，加上在异步网络模型下无法控制请求到达service的先后顺序，只能保证client内部的偏序。

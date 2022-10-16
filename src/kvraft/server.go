@@ -37,7 +37,7 @@ func (kv *KVServer) applier() {
 			}
 			commandIndex, op := applyMsg.CommandIndex, applyMsg.Command.(Op)
 			kv.mu.Lock()
-			if GET != op.Method && kv.isDuplicate(op.ClientId, op.SequenceNum) {
+			if GET != op.Method && kv.isDuplicate(op.ClientId, op.SequenceNum) {//put幂等性保证
 				reply = kv.clientSession[op.ClientId].Reply
 			} else {
 				switch op.Method {
